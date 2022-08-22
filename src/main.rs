@@ -1,14 +1,16 @@
 #![allow(unused)]
 
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::Write;
+
 use eyre::{Context, Result};
 use indoc::indoc;
 use serde::{Deserialize, Serialize};
 use string_template::Template;
 
-use std::{collections::BTreeMap, fs::File};
-
 #[derive(Copy, Clone, PartialEq, Eq, Deserialize)]
-enum ApiDocsSchemaObjectType {
+enum ApiDocsModelObjectType {
     String,
     Number,
     Boolean,
@@ -17,18 +19,18 @@ enum ApiDocsSchemaObjectType {
     Enum,
 }
 
-type ApiDocsSchemaObject = BTreeMap<String, ApiDocsSchema>;
-type ApiDocsSchemasObject = BTreeMap<String, ApiDocsSchema>;
+type ApiDocsModelObject = BTreeMap<String, ApiDocsModel>;
+type ApiDocsModelsObject = BTreeMap<String, ApiDocsModel>;
 
 #[derive(Deserialize)]
-struct ApiDocsSchema {
-    r#type: ApiDocsSchemaObjectType,
-    /// Schema if `type` is `object`
-    fields: Option<ApiDocsSchemaObject>,
-    /// Schema if `type` is `array`
-    schema: Option<Box<ApiDocsSchema>>,
-    /// Schema if `type` is `enum`
-    members: Option<Vec<String>>,
+struct ApiDocsModel {
+    r#type: ApiDocsModelObjectType,
+    /// Model if `type` is `object`
+    fields: Option<ApiDocsModelObject>,
+    /// Model if `type` is `array`
+    model: Option<Box<ApiDocsModel>>,
+    /// Model if `type` is `enum`
+    members: Option<Vec<serde_json::Value>>,
     required: bool,
 }
 
@@ -40,12 +42,13 @@ struct ApiDocsRoute {
 
 #[derive(Deserialize)]
 struct ApiDocs {
-    schemas: ApiDocsSchemasObject,
+    models: BTreeMap<String, ApiDocsModelsObject>,
     routes: BTreeMap<String, ApiDocsRoute>,
 }
 
 struct Args {
     file: String,
+    out: String,
 }
 
 fn interface_field_template(name: &str, r#type: &str) -> String {
@@ -73,27 +76,31 @@ fn interface_template(name: &str, content: &str) -> String {
     .render(&[("name", name), ("content", content)].into())
 }
 
-fn render_field_type(obj: &ApiDocsSchema) -> String {
+fn render_field_type(obj: &ApiDocsModel) -> String {
     let inner_type = match &obj.r#type {
-        ApiDocsSchemaObjectType::String => "string".to_string(),
-        ApiDocsSchemaObjectType::Number => "number".to_string(),
-        ApiDocsSchemaObjectType::Boolean => "boolean".to_string(),
-        ApiDocsSchemaObjectType::Array => format!(
-            "Array<{}>",
-            render_field_type(
-                &obj.schema
-                    .as_ref()
-                    .expect("`schema` must be present if `type` is `\"array\"`")
+        ApiDocsModelObjectType::String => "string".to_string(),
+        ApiDocsModelObjectType::Number => "number".to_string(),
+        ApiDocsModelObjectType::Boolean => "boolean".to_string(),
+        ApiDocsModelObjectType::Array => {
+            format!(
+                "Array<{}>",
+                render_field_type(
+                    obj.model
+                        .as_ref()
+                        .expect("`model` must be present if `type` is `\"array\"`")
+                )
             )
-        ),
-        ApiDocsSchemaObjectType::Object => format!(
-            "{{ {} }}",
-            render_interface_fields(
-                &obj.fields
-                    .as_ref()
-                    .expect("`fields` must be set if `type` is `\"object\"`.")
+        },
+        ApiDocsModelObjectType::Object => {
+            format!(
+                "{{ {} }}",
+                render_fields(
+                    obj.fields
+                        .as_ref()
+                        .expect("`fields` must be set if `type` is `\"object\"`.")
+                )
             )
-        ),
+        },
         _ => todo!(),
     };
 
@@ -104,20 +111,32 @@ fn render_field_type(obj: &ApiDocsSchema) -> String {
     }
 }
 
-fn render_interface_field(name: &str, schema: &ApiDocsSchema) -> String {
+fn render_field(name: &str, model: &ApiDocsModel) -> String {
     format!(
         "{name}{opt}: {type},",
-        opt = schema.required.then_some("").unwrap_or("?"),
-        r#type = render_field_type(schema)
+        opt = model.required.then_some("").unwrap_or("?"),
+        r#type = render_field_type(model)
     )
 }
 
-fn render_interface_fields(obj: &ApiDocsSchemasObject) -> String {
-    todo!()
+fn render_fields(obj: &ApiDocsModelsObject) -> String {
+    obj.iter()
+        .map(|(name, model)| render_field(name, model))
+        .collect::<String>()
 }
 
-fn render_interface(name: &str, obj: &ApiDocsSchema) -> String {
-    todo!()
+fn render_interface(name: &str, obj: &ApiDocsModelObject) -> String {
+    format!("interface {name} {{ {} }}", render_fields(obj))
+}
+
+fn render_interfaces(models: &BTreeMap<String, ApiDocsModelObject>) -> String {
+    models
+        .iter()
+        .map(|(model_name, model)| {
+            let name = heck::AsPascalCase(model_name).to_string();
+            render_interface(&name, model)
+        })
+        .collect::<String>()
 }
 
 fn main() -> Result<()> {
@@ -126,6 +145,7 @@ fn main() -> Result<()> {
     let mut args = pico_args::Arguments::from_env();
     let args = Args {
         file: args.value_from_str("--file")?,
+        out: args.value_from_str("--out")?,
     };
 
     let api_docs: ApiDocs = serde_json::from_reader(
@@ -133,9 +153,15 @@ fn main() -> Result<()> {
             .wrap_err_with(|| format!("Failed to open: {}", args.file.clone()))?,
     )?;
 
-    api_docs.schemas.iter().map(|(schema_name, schema_object)| {
-        let name = heck::AsPascalCase(schema_name).to_string();
-    });
+    let interfaces = render_interfaces(&api_docs.models);
+
+    let mut out_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&args.out)?;
+
+    out_file.write_all(interfaces.as_bytes());
 
     Ok(())
 }
@@ -146,10 +172,10 @@ mod tests {
 
     #[test]
     fn test_render_field_type_string() {
-        let rendered = render_field_type(&ApiDocsSchema {
-            r#type: ApiDocsSchemaObjectType::String,
+        let rendered = render_field_type(&ApiDocsModel {
+            r#type: ApiDocsModelObjectType::String,
             fields: None,
-            schema: None,
+            model: None,
             members: None,
             required: true,
         });
@@ -158,10 +184,10 @@ mod tests {
 
     #[test]
     fn test_render_field_type_number() {
-        let rendered = render_field_type(&ApiDocsSchema {
-            r#type: ApiDocsSchemaObjectType::Number,
+        let rendered = render_field_type(&ApiDocsModel {
+            r#type: ApiDocsModelObjectType::Number,
             fields: None,
-            schema: None,
+            model: None,
             members: None,
             required: false,
         });
@@ -170,10 +196,10 @@ mod tests {
 
     #[test]
     fn test_render_field_type_boolean() {
-        let rendered = render_field_type(&ApiDocsSchema {
-            r#type: ApiDocsSchemaObjectType::Boolean,
+        let rendered = render_field_type(&ApiDocsModel {
+            r#type: ApiDocsModelObjectType::Boolean,
             fields: None,
-            schema: None,
+            model: None,
             members: None,
             required: false,
         });
@@ -182,14 +208,14 @@ mod tests {
 
     #[test]
     fn test_render_field_type_array_of_scalar() {
-        let rendered = render_field_type(&ApiDocsSchema {
-            r#type: ApiDocsSchemaObjectType::Array,
+        let rendered = render_field_type(&ApiDocsModel {
+            r#type: ApiDocsModelObjectType::Array,
             fields: None,
             members: None,
-            schema: Some(Box::new(ApiDocsSchema {
-                r#type: ApiDocsSchemaObjectType::Boolean,
+            model: Some(Box::new(ApiDocsModel {
+                r#type: ApiDocsModelObjectType::Boolean,
                 fields: None,
-                schema: None,
+                model: None,
                 members: None,
                 required: true,
             })),
@@ -199,20 +225,62 @@ mod tests {
     }
 
     #[test]
-    fn test_render_field_type_array_of_array() {
-        let rendered = render_field_type(&ApiDocsSchema {
-            r#type: ApiDocsSchemaObjectType::Array,
+    fn test_render_field_type_array_of_object() {
+        let rendered = render_field_type(&ApiDocsModel {
+            r#type: ApiDocsModelObjectType::Array,
             fields: None,
             members: None,
-            schema: Some(Box::new(ApiDocsSchema {
-                r#type: ApiDocsSchemaObjectType::Array,
+            model: Some(Box::new(ApiDocsModel {
+                r#type: ApiDocsModelObjectType::Object,
+                members: None,
+                model: None,
+                fields: Some(
+                    [
+                        (
+                            "foo".to_string(),
+                            ApiDocsModel {
+                                r#type: ApiDocsModelObjectType::String,
+                                fields: None,
+                                members: None,
+                                model: None,
+                                required: true,
+                            },
+                        ),
+                        (
+                            "bar".to_string(),
+                            ApiDocsModel {
+                                r#type: ApiDocsModelObjectType::Boolean,
+                                fields: None,
+                                members: None,
+                                model: None,
+                                required: true,
+                            },
+                        ),
+                    ]
+                    .into(),
+                ),
+                required: true,
+            })),
+            required: false,
+        });
+        k9::snapshot!(rendered, "Optional<Array<{ bar: boolean,foo: string, }>>");
+    }
+
+    #[test]
+    fn test_render_field_type_array_of_array() {
+        let rendered = render_field_type(&ApiDocsModel {
+            r#type: ApiDocsModelObjectType::Array,
+            fields: None,
+            members: None,
+            model: Some(Box::new(ApiDocsModel {
+                r#type: ApiDocsModelObjectType::Array,
                 fields: None,
                 members: None,
-                schema: Some(Box::new(ApiDocsSchema {
-                    r#type: ApiDocsSchemaObjectType::String,
+                model: Some(Box::new(ApiDocsModel {
+                    r#type: ApiDocsModelObjectType::String,
                     fields: None,
                     members: None,
-                    schema: None,
+                    model: None,
                     required: true,
                 })),
                 required: true,
@@ -224,12 +292,12 @@ mod tests {
 
     #[test]
     fn test_render_required_field() {
-        let rendered = render_interface_field(
+        let rendered = render_field(
             "foo",
-            &ApiDocsSchema {
-                r#type: ApiDocsSchemaObjectType::Boolean,
+            &ApiDocsModel {
+                r#type: ApiDocsModelObjectType::Boolean,
                 fields: None,
-                schema: None,
+                model: None,
                 members: None,
                 required: true,
             },
@@ -239,16 +307,127 @@ mod tests {
 
     #[test]
     fn test_render_non_required_field() {
-        let rendered = render_interface_field(
+        let rendered = render_field(
             "foo",
-            &ApiDocsSchema {
-                r#type: ApiDocsSchemaObjectType::Boolean,
+            &ApiDocsModel {
+                r#type: ApiDocsModelObjectType::Boolean,
                 fields: None,
-                schema: None,
+                model: None,
                 members: None,
                 required: false,
             },
         );
         k9::snapshot!(rendered, "foo?: Optional<boolean>,");
+    }
+
+    #[test]
+    fn test_render_interface_simple() {
+        let rendered = render_interface(
+            "Foo",
+            &[
+                (
+                    "foo".to_string(),
+                    ApiDocsModel {
+                        r#type: ApiDocsModelObjectType::String,
+                        fields: None,
+                        members: None,
+                        model: None,
+                        required: true,
+                    },
+                ),
+                (
+                    "bar".to_string(),
+                    ApiDocsModel {
+                        r#type: ApiDocsModelObjectType::Boolean,
+                        fields: None,
+                        members: None,
+                        model: None,
+                        required: true,
+                    },
+                ),
+            ]
+            .into(),
+        );
+        k9::snapshot!(rendered, "interface Foo { bar: boolean,foo: string, }");
+    }
+
+    #[test]
+    fn test_render_interface_with_nested_objects() {
+        let rendered = render_interface(
+            "Foo",
+            &[
+                (
+                    "foo".to_string(),
+                    ApiDocsModel {
+                        r#type: ApiDocsModelObjectType::String,
+                        fields: None,
+                        members: None,
+                        model: None,
+                        required: true,
+                    },
+                ),
+                (
+                    "bar".to_string(),
+                    ApiDocsModel {
+                        r#type: ApiDocsModelObjectType::Object,
+                        fields: Some(
+                            [
+                                (
+                                    "foo".to_string(),
+                                    ApiDocsModel {
+                                        r#type: ApiDocsModelObjectType::String,
+                                        fields: None,
+                                        members: None,
+                                        model: None,
+                                        required: true,
+                                    },
+                                ),
+                                (
+                                    "bar".to_string(),
+                                    ApiDocsModel {
+                                        r#type: ApiDocsModelObjectType::Boolean,
+                                        fields: None,
+                                        members: None,
+                                        model: None,
+                                        required: true,
+                                    },
+                                ),
+                            ]
+                            .into(),
+                        ),
+                        members: None,
+                        model: None,
+                        required: true,
+                    },
+                ),
+            ]
+            .into(),
+        );
+        k9::snapshot!(
+            rendered,
+            "interface Foo { bar: { bar: boolean,foo: string, },foo: string, }"
+        );
+    }
+
+    #[test]
+    fn test_render_models_simple() {
+        let rendered = render_interfaces(
+            &[(
+                "Foo".to_string(),
+                [(
+                    "baz".to_string(),
+                    ApiDocsModel {
+                        r#type: ApiDocsModelObjectType::Boolean,
+                        required: true,
+                        fields: None,
+                        members: None,
+                        model: None,
+                    },
+                )]
+                .into(),
+            )]
+            .into(),
+        );
+        k9::snapshot!(rendered, "interface Foo { baz: boolean, }");
     }
 }
